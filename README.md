@@ -6,7 +6,8 @@ or anywhere with Docker/Python.
 
 ## Live demo
 
-- Deployed on Render: *(add your Render URL once deployed — e.g. https://ai-agent-final.onrender.com)*
+- **Live:** https://ai-agent-final-reet.onrender.com
+- GitHub: https://github.com/LUFICR/Ai-Agent-Final
 - Local: see [README_LOCAL.md](README_LOCAL.md)
 
 ## What it is
