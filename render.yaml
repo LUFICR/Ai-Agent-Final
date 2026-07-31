@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: wellness-companion
+    runtime: docker
+    repo: https://github.com/LUFICR/wellness-companion
+    plan: free
+    region: oregon
+    dockerContext: .
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false

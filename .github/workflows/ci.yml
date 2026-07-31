@@ -1,0 +1,30 @@
+name: CI + Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python -c "import sys; sys.path.insert(0,'.'); from wellness_agent.orchestrator import Orchestrator; print('Imports OK')"
+
+  deploy:
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Deploy to HuggingFace Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          git remote add space "https://user:$HF_TOKEN@huggingface.co/spaces/${{ secrets.HF_SPACE_ID }}"
+          git push --force space HEAD:main
