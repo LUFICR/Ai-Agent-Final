@@ -6,7 +6,7 @@ or anywhere with Docker/Python.
 
 ## Live demo
 
-- Deployed HuggingFace Space: *(insert your Space URL here)*
+- Deployed on Render: *(add your Render URL once deployed — e.g. https://ai-agent-final.onrender.com)*
 - Local: see [README_LOCAL.md](README_LOCAL.md)
 
 ## What it is

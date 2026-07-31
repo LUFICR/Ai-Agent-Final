@@ -19,12 +19,10 @@ jobs:
     needs: check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Deploy to HuggingFace Space
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      - name: Trigger Render Deploy
         run: |
-          git remote add space "https://user:$HF_TOKEN@huggingface.co/spaces/${{ secrets.HF_SPACE_ID }}"
-          git push --force space HEAD:main
+          curl -X POST "https://api.render.com/v1/services/srv-d9lfq1ou01pc73ffgmug/deploys" \
+            -H "Accept: application/json" \
+            -H "Authorization: Bearer ${{ secrets.RENDER_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{"clearCache":"do_not_clear"}'
