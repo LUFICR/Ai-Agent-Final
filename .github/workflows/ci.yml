@@ -21,7 +21,7 @@ jobs:
     steps:
       - name: Trigger Render Deploy
         run: |
-          curl -X POST "https://api.render.com/v1/services/srv-d9lfq1ou01pc73ffgmug/deploys" \
+          curl -X POST "https://api.render.com/v1/services/srv-d9mgu65aeets73a0icp0/deploys" \
             -H "Accept: application/json" \
             -H "Authorization: Bearer ${{ secrets.RENDER_API_KEY }}" \
             -H "Content-Type: application/json" \
