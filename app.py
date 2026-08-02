@@ -5,7 +5,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv()
 from fastapi import FastAPI, Request, Form
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from wellness_agent.orchestrator import Orchestrator
 from wellness_agent.utils.storage import load_json
 
@@ -142,6 +142,61 @@ async def reset(session_id: str = "default"):
     orch = get_orch(session_id)
     orch.reset_state()
     return JSONResponse({"status": "reset"})
+
+
+@app.get("/api/logs")
+async def api_logs():
+    """List all recorded conversation logs (JSON files)."""
+    from wellness_agent.conversation_logger import get_conversation_logger
+    logger = get_conversation_logger()
+    logger.flush()
+    entries = []
+    for f in sorted(logger.log_dir.glob("conversation_*.json")):
+        data = load_json(f) or {}
+        meta = data.get("metadata") or {}
+        entries.append({
+            "filename": f.name,
+            "conversation_id": meta.get("conversation_id") or data.get("conversation_id"),
+            "started_at": meta.get("started_at") or data.get("started_at"),
+            "ended": (meta.get("ended_at") or data.get("ended_at")) is not None,
+            "turns": len(data.get("turns", []) or []),
+            "size_bytes": f.stat().st_size,
+        })
+    return JSONResponse({"count": len(entries), "conversations": entries})
+
+
+@app.get("/api/logs/{filename}")
+async def api_log_download(filename: str, format: str = "json"):
+    """Download one conversation log as JSON or Markdown (default: json)."""
+    from wellness_agent.conversation_logger import (
+        _render_markdown_turn,
+        get_conversation_logger,
+    )
+    logger = get_conversation_logger()
+    logger.flush()
+    name = Path(filename).name
+    if not name.startswith("conversation_") or not name.endswith(".json"):
+        return JSONResponse({"error": "invalid filename"}, status_code=400)
+    path = (logger.log_dir / name).resolve()
+    if path.parent != logger.log_dir.resolve():
+        return JSONResponse({"error": "invalid filename"}, status_code=400)
+    if not path.exists():
+        return JSONResponse({"error": "not found"}, status_code=404)
+    data = load_json(path) or {}
+    if format == "md":
+        turns = data.get("turns", []) or []
+        md = "".join(
+            _render_markdown_turn(None, turn, include_header=(i == 0))
+            for i, turn in enumerate(turns)
+        )
+        return Response(
+            content=md, media_type="text/markdown",
+            headers={"Content-Disposition": f'attachment; filename="{name[:-5]}.md"'},
+        )
+    return JSONResponse(
+        data,
+        headers={"Content-Disposition": f'attachment; filename="{name}"'},
+    )
 
 
 @app.get("/health")
