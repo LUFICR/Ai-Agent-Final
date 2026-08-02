@@ -23,6 +23,15 @@ SHORT_DEFLECTIONS = frozenset([
     "i guess", "whatever", "fine", "okay", "ok",
 ])
 
+# Question Priority (QUESTION_SELECTION_POLICY): planner ladder stage ->
+# question type hint used when building the next question.
+_PRIORITY_TYPE_MAP = {
+    "reflective": "reflective",
+    "clarifying": "clarifying",
+    "narrowing": "choice",
+    "action": "future",
+}
+
 # Message variants per state — cycles through these to avoid verbatim repeats
 _MESSAGE_VARIANTS = {
     "free_conversation": [
@@ -623,6 +632,11 @@ class Orchestrator:
         msg_lower = msg.strip().lower()
         emotion_words = set(["sad", "lonely", "down", "tired", "anxious",
                              "stressed", "overwhelm", "burnout"])
+        topic_words = set(["work", "sleep", "stress", "anxiety", "mood", "sad",
+                           "lonely", "tired", "family", "friend", "relationship",
+                           "exercise", "health", "eat", "food", "routine",
+                           "focus", "energy", "money", "finances", "motivation",
+                           "procrastination", "depressed", "overwhelm", "burnout"])
         return {
             "message": msg,
             "intent_graph": intent_graph or {},
@@ -637,6 +651,7 @@ class Orchestrator:
             "exit_consumed": self._exit_consumed,
             "minimal_input": not msg.strip() or len(msg.strip().split()) < 3,
             "has_emotion_keyword": any(w in msg_lower for w in emotion_words),
+            "has_topic_signal": any(t in msg_lower for t in topic_words),
         }
 
     # ─── Response Generation (LLM-enhanced) ───────────────────
@@ -683,12 +698,15 @@ class Orchestrator:
             elif meta.get("quick_tree"):
                 resp = self._quick_tree_response(user_message)
             else:
-                resp = self._question_response(emotion, reasoning_ctx)
+                resp = self._question_response(emotion, reasoning_ctx, meta)
         elif action == "confirm_understanding":
             resp = self._confirm_response(decision, user_message)
         elif action == "provide_insight":
             if meta.get("insight"):
-                resp = self._insight_response()
+                if meta.get("loop_break") and not self.current_pillar:
+                    resp = self._reflection_response()
+                else:
+                    resp = self._insight_response()
             else:
                 resp = self._insight_variant_response()
         elif action == "provide_recommendation":
@@ -701,9 +719,9 @@ class Orchestrator:
             elif meta.get("default"):
                 resp = self._default_response()
             else:
-                resp = self._question_response(emotion, reasoning_ctx)
+                resp = self._question_response(emotion, reasoning_ctx, meta)
         elif action == "explore_topic":
-            resp = self._question_response(emotion, reasoning_ctx)
+            resp = self._question_response(emotion, reasoning_ctx, meta)
         else:
             import logging
             logging.warning(
@@ -757,21 +775,21 @@ class Orchestrator:
     def _greeting_response(self):
         session_num = self.agents.memory.memory.get("session_count", 1)
         known = self.agents.memory.get_known_pillars()
-        opts = self.agents.question_planner.generate_question(
-            "mood", "greeting", memory_context={})
-        options = opts.get("options") or opts.get("response_options")
         proactive = self._proactive_checkin()
         if proactive and session_num > 1:
             text = proactive["question"]
         elif session_num <= 1:
-            text = "Hey there. I'm your wellness companion. I'm here to help you understand yourself better — no judgment, no agenda. How are you feeling today?"
+            text = ("Hey there. I'm your wellness companion. I'm here to help "
+                    "you understand yourself better — no judgment, no agenda. "
+                    "What's been on your mind lately?")
         else:
             pillars_known = list(known.keys())
             if pillars_known:
                 text = f"Welcome back. Last time we touched on {pillars_known[0]}. How have things been since we talked?"
             else:
                 text = "Welcome back. I'm glad you're here. What's on your mind today?"
-        return {"text": text, "options": options}
+        # Greeting Policy: welcome naturally + one open question. Never buttons.
+        return {"text": text, "options": None}
 
     def _force_choice_response(self):
         text = "Which of these areas feels most relevant right now?"
@@ -870,16 +888,23 @@ class Orchestrator:
             options = ["Productivity", "Physical health", "Mental wellness"]
         return {"text": text, "options": options}
 
-    def _question_response(self, emotion, reasoning_ctx):
-        q_data = self._generate_question(emotion, reasoning_ctx)
-        return {"text": q_data["question_text"], "options": q_data.get("response_options")}
+    def _question_response(self, emotion, reasoning_ctx, meta=None):
+        meta = meta or {}
+        q_data = self._generate_question(emotion, reasoning_ctx,
+                                         priority_hint=meta.get("question_priority"))
+        # Button Policy: buttons are a fallback — free text unless the
+        # planner explicitly sanctioned choice buttons.
+        if meta.get("button_mode") == "choice":
+            return {"text": q_data["question_text"], "options": q_data.get("response_options")}
+        return {"text": q_data["question_text"], "options": None}
 
     def _insight_response(self):
-        return {"text": self._generate_insight(), "options": ["Yes, that's it", "Partly", "Not quite"]}
+        # Value first: insight stands on its own; confirmation is free text.
+        return {"text": self._generate_insight(), "options": None}
 
     def _insight_variant_response(self):
         return {"text": next(self._response_cyclers["insight_generation"]),
-                "options": ["Yes, that's it", "Partly", "Not quite"]}
+                "options": None}
 
     def _routine_response(self):
         return {"text": self._generate_routine_suggestion(), "options": self._intervention_options()}
@@ -902,14 +927,14 @@ class Orchestrator:
         return {"text": text, "options": ["Good for today", "One more thing"]}
 
     def _follow_up_response(self):
-        return {"text": next(self._response_cyclers["follow_up"]), "options": ["Better", "Same", "Rougher"]}
+        return {"text": next(self._response_cyclers["follow_up"]), "options": None}
 
     def _free_conversation_response(self):
         return {"text": next(self._response_cyclers["free_conversation"]), "options": None}
 
     def _rapport_response(self):
         return {"text": next(self._response_cyclers["rapport_building"]),
-                "options": ["🙂 Good", "😑 Meh", "Rough one"]}
+                "options": None}
 
     def _avoidance_response(self):
         return {"text": next(self._response_cyclers["avoidance_detection"]),
@@ -917,7 +942,7 @@ class Orchestrator:
 
     def _soft_response(self):
         return {"text": next(self._response_cyclers["soft_exploration"]),
-                "options": ["A specific thing", "Just talking helps", "Not sure yet"]}
+                "options": None}
 
     def _default_response(self):
         return {"text": next(self._response_cyclers["default"]), "options": None}
@@ -1010,7 +1035,8 @@ class Orchestrator:
         return {"text": text, "options": None}
 
     def _resume_topic_response(self, decision, emotion, reasoning_ctx):
-        target = (decision.metadata or {}).get("target_topic")
+        meta = decision.metadata or {}
+        target = meta.get("target_topic")
         if target in PILLARS and target != self.current_pillar:
             self.current_pillar = target
             self.state_machine.select_pillar(target)
@@ -1019,7 +1045,9 @@ class Orchestrator:
         if self.current_pillar:
             q_data = dict(q_data)
             q_data["question_text"] = f"Back to what we were exploring — {q_data['question_text']}"
-        return {"text": q_data["question_text"], "options": q_data.get("response_options")}
+        if meta.get("button_mode") == "choice":
+            return {"text": q_data["question_text"], "options": q_data.get("response_options")}
+        return {"text": q_data["question_text"], "options": None}
 
     def _commitment_response(self):
         rec = self._ranked_interventions[0] if self._ranked_interventions else {}
@@ -1046,7 +1074,7 @@ class Orchestrator:
 
     # ─── LLM-Integrated Phase 7: Questions ────────────────────
 
-    def _generate_question(self, emotion, reasoning_ctx=None):
+    def _generate_question(self, emotion, reasoning_ctx=None, priority_hint=None):
         ctx = reasoning_ctx or self.reasoning_ctx or {}
         if self.state_machine.current_state == "deep_investigation" and self.current_pillar:
             pillar = self.current_pillar
@@ -1073,11 +1101,16 @@ class Orchestrator:
                 self.agents.question_planner.reset_deep_count()
 
         # Try LLM-generated question first
-        type_hint = self.agents.objective_engine.question_type_hint(
-            (self.current_objective or {}).get("objective"))
-        behavior_hint = self._behavior_question_hint()
-        if behavior_hint:
-            type_hint = behavior_hint
+        if priority_hint:
+            # Question Priority (QUESTION_SELECTION_POLICY): the planner's
+            # ladder stage wins over every other type hint; never reversed.
+            type_hint = _PRIORITY_TYPE_MAP.get(priority_hint, "")
+        else:
+            type_hint = self.agents.objective_engine.question_type_hint(
+                (self.current_objective or {}).get("objective"))
+            behavior_hint = self._behavior_question_hint()
+            if behavior_hint:
+                type_hint = behavior_hint
         llm_q = self.llm.generate_question(
             target_pillar=pillar,
             current_state=self.state_machine.current_state,

@@ -78,6 +78,13 @@ class QuestionPlanner:
 
         # State-specific canned options (for states without pillar context)
         if current_state in STATE_OPTIONS:
+            if preferred_type_hint and preferred_type_hint != "choice":
+                # Question Priority (QUESTION_SELECTION_POLICY): the planner's
+                # ladder stage wins — never show the canned category tree when
+                # a priority-guided question is requested.
+                q = self._get_question_for_pillar(target_pillar, preferred_type_hint, current_state)
+                q["question_type"] = preferred_type_hint
+                return q
             q = dict(STATE_OPTIONS[current_state])
             if current_state == "pillar_selection":
                 q["options"] = self._pillar_options(target_pillar, memory_context or {})

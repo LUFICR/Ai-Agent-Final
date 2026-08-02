@@ -157,6 +157,11 @@ _CASUAL_RE = re.compile(
     re.IGNORECASE,
 )
 
+_GOODBYE_RE = re.compile(
+    r"\b(bye|goodbye|good night|see you|talk (to you )?later|catch you "
+    r"later|i'?m (going|off) now|that'?s all for today|gotta go|"
+    r"got to go|take care now|have a good (day|night))\b", re.IGNORECASE)
+
 _QUESTION_START_RE = re.compile(
     r"^(?:why|what|how|when|where|which|who|can|could|would|should|"
     r"do|does|did|is|are|will|am)\b",
@@ -216,6 +221,23 @@ _TIME_RE = re.compile(
 _ASKING_ACTIONS = (PlannerAction.ASK_QUESTION, PlannerAction.EXPLORE_TOPIC,
                    PlannerAction.CLARIFY)
 
+# ─── QUESTION_SELECTION_POLICY.md (v1.0) — deterministic rules ─────────
+
+# Button Policy: buttons MAY appear only when the user cannot articulate
+# (uncertainty), confidence is low (< 0.60), the user ignored two
+# clarification attempts, or during onboarding. Otherwise: natural free text.
+_UNCERTAINTY_RE = re.compile(
+    r"\bi don'?t know\b|\bidk\b|\bnot sure\b|\bunsure\b|\bhard to say\b|"
+    r"\bcan'?t decide\b|\bcannot decide\b|\bconfus|"
+    r"\bi'?m not sure\b|\bdunno\b|\bno idea\b|\bno clue\b",
+    re.IGNORECASE,
+)
+
+# Question Priority (never reversed): Reflective -> Clarifying -> Narrowing
+# -> Action -> Commitment.
+_QUESTION_LADDER = ("reflective", "clarifying", "narrowing", "action",
+                    "commitment")
+
 
 class ConversationPlanner:
     """V2 decision engine: modes, actions, interruptions, commitments, loops."""
@@ -235,6 +257,7 @@ class ConversationPlanner:
         self._pending_recommendation = False
         self._commit_stage = None
         self._asked = set()
+        self._ladder_idx = 0
 
     # ─── public API ─────────────────────────────────────────────────
 
@@ -251,6 +274,7 @@ class ConversationPlanner:
         self._pending_recommendation = False
         self._commit_stage = None
         self._asked = set()
+        self._ladder_idx = 0
 
     def current_mode(self):
         return self.mode
@@ -306,7 +330,15 @@ class ConversationPlanner:
                 confidence=0.90,
                 metadata={"target_topic": target}))
 
-        # 5. casual chat suspends coaching
+        # 5. goodbyes close the conversation gracefully (never re-open it)
+        if self._is_goodbye(message):
+            return self._record(PlannerDecision(
+                PlannerAction.CLOSE_CONVERSATION,
+                "user said goodbye — close gracefully",
+                confidence=0.90,
+                metadata={"graceful": True}))
+
+        # 6. casual chat suspends coaching
         if self._is_casual(message):
             return self._record(self._enter_temporary(
                 ConversationMode.CASUAL_CHAT,
@@ -475,16 +507,21 @@ class ConversationPlanner:
 
         if state == "greeting":
             self._enter_mode(ConversationMode.DISCOVERY, by="new_conversation")
+            self._reset_ladder()
             return PlannerDecision(
-                PlannerAction.ASK_QUESTION, "opening greeting in discovery",
-                metadata={"greeting": True})
+                PlannerAction.ASK_QUESTION,
+                "greeting policy: welcome naturally, one open question, no categories",
+                metadata={"greeting": True, "open_question": True,
+                          "question_priority": "reflective",
+                          "button_mode": "free"})
 
-        if "question_planner" in route and avoidance == 1 and not exit_consumed:
+        if "question_planner" in route and avoidance == 1 and not exit_consumed \
+                and not ctx.get("minimal_input"):
             self._enter_mode_for_state(state)
             return PlannerDecision(
                 PlannerAction.CLARIFY,
                 "avoidance: force choice with concrete options",
-                metadata={"force_choice": True})
+                metadata={"force_choice": True, "button_mode": "choice"})
 
         if avoidance >= 3 and not exit_offered and not exit_consumed:
             self._enter_mode_for_state(state)
@@ -500,23 +537,39 @@ class ConversationPlanner:
                 "avoidance at rapport: offer casual conversation",
                 metadata={"casual_offer": True})
 
-        if state != "greeting" and (ctx.get("minimal_input") or ctx.get("has_emotion_keyword")):
+        # Rich Free Text Policy: emotion/context/cause/timeline present ->
+        # continue naturally; free text ALWAYS beats buttons. The planner
+        # never asks a category question when the problem is already described.
+        if state != "greeting" and self._is_rich_input(ctx):
             self._enter_mode_for_state(state)
             return PlannerDecision(
-                PlannerAction.CLARIFY,
-                "short or emotional input: narrow with a category tree",
-                metadata={"quick_tree": True})
+                PlannerAction.EXPLORE_TOPIC,
+                "rich free text: continue naturally, free text beats buttons",
+                confidence=0.85,
+                metadata={"question_priority": self._next_ladder_stage(),
+                          "button_mode": "free", "natural": True})
 
         if "question_planner" in route:
             self._enter_mode_for_state(state)
+            button_mode = self._button_mode(ctx)
             if state == "deep_investigation":
                 return PlannerDecision(
                     PlannerAction.EXPLORE_TOPIC,
                     "deepening understanding of the active branch",
-                    metadata={"pillar": ctx.get("current_pillar")})
+                    metadata={"pillar": ctx.get("current_pillar"),
+                              "question_priority": self._next_ladder_stage(),
+                              "button_mode": button_mode})
+            if button_mode == "choice":
+                # Button Policy fallback: user cannot articulate a topic.
+                return PlannerDecision(
+                    PlannerAction.CLARIFY,
+                    "fallback: user cannot articulate — choice buttons are the recovery tool",
+                    metadata={"quick_tree": True, "button_mode": "choice"})
             return PlannerDecision(
                 PlannerAction.ASK_QUESTION, "discovery question",
-                metadata={"pillar": ctx.get("current_pillar")})
+                metadata={"pillar": ctx.get("current_pillar"),
+                          "question_priority": self._next_ladder_stage(),
+                          "button_mode": "free"})
 
         if "root_cause_engine" in route and ctx.get("current_pillar") and "question_planner" not in route:
             self._enter_mode_for_state(state)
@@ -603,30 +656,27 @@ class ConversationPlanner:
     # ─── loop prevention (spec Chapter 3) ──────────────────────────
 
     def _apply_loop_guard(self, decision, ctx):
+        """Maximum Questions Rule: at most 2 consecutive questions; the third
+        consecutive asking decision MUST provide value (insight), never WAIT."""
         ig = ctx.get("intent_graph") or {}
         progress = bool(ig.get("answered_current_question")) or bool(ig.get("new_slots_detected"))
         primary = (ig.get("primary_intent") or {}).get("intent", "")
         if progress or primary in ("answer", "additional_information", "commitment", "goal_update"):
             self._asking_streak = 0
         elif decision.action in _ASKING_ACTIONS and self.last_decision and \
-                self.last_decision.action == decision.action:
+                self.last_decision.action in _ASKING_ACTIONS:
             self._asking_streak += 1
         else:
             self._asking_streak = 0
 
         if self._asking_streak >= 2 and decision.action in _ASKING_ACTIONS:
-            if self.mode in (ConversationMode.INVESTIGATION, ConversationMode.COACHING):
-                self._asking_streak = 0
-                return PlannerDecision(
-                    PlannerAction.PROVIDE_INSIGHT,
-                    "loop prevention: repeated questions without new information",
-                    confidence=0.75,
-                    metadata={"loop_break": True})
+            self._asking_streak = 0
+            self._reset_ladder()
             return PlannerDecision(
-                PlannerAction.WAIT,
-                "loop prevention: repeated questions without progress",
+                PlannerAction.PROVIDE_INSIGHT,
+                "maximum questions rule: two consecutive questions asked — provide value now",
                 confidence=0.75,
-                metadata={"loop_break": True})
+                metadata={"loop_break": True, "insight": True})
         return decision
 
     # ─── signal detectors ──────────────────────────────────────────
@@ -636,6 +686,9 @@ class ConversationPlanner:
 
     def _is_casual(self, message):
         return bool(message) and bool(_CASUAL_RE.search(message))
+
+    def _is_goodbye(self, message):
+        return bool(message) and bool(_GOODBYE_RE.search(message))
 
     def _is_topic_switch(self, message, ig):
         if (ig.get("topic_shift") or ig.get("branch_change_requested")):
@@ -685,6 +738,56 @@ class ConversationPlanner:
                     return pillar
         return None
 
+    # ─── QUESTION_SELECTION_POLICY helpers ────────────────────────────
+
+    def _is_rich_input(self, ctx):
+        """Rich Free Text Policy: the user provided emotion/context/cause/
+        timeline — that input always beats buttons and never deserves a
+        category question."""
+        message = (ctx.get("message") or "").strip()
+        words = message.split()
+        if not words:
+            return False
+        if len(words) >= 8:
+            # Substantive message: context/cause/timeline beats keyword matching
+            return True
+        if len(words) < 3:
+            return False
+        return bool(ctx.get("has_emotion_keyword") or ctx.get("has_topic_signal"))
+
+    def _button_mode(self, ctx):
+        """Button Policy: buttons are a fallback, never the primary UI.
+        Returns 'choice' only when one of the sanctioned conditions holds."""
+        # Rich Free Text Policy: free text ALWAYS beats buttons
+        if self._is_rich_input(ctx):
+            return "free"
+        message = (ctx.get("message") or "").strip()
+        if _UNCERTAINTY_RE.search(message):
+            return "choice"
+        ig = ctx.get("intent_graph") or {}
+        confidence = (ig.get("confidence_scores") or {}).get("overall_confidence")
+        if confidence is None:
+            confidence = ig.get("overall_confidence")
+        if isinstance(confidence, (int, float)) and confidence < 0.60:
+            return "choice"
+        if (ctx.get("avoidance_count") or 0) >= 2:
+            return "choice"
+        state = ctx.get("state") or ""
+        if state in ("guided_discovery", "pillar_selection") and \
+                not ctx.get("minimal_input"):
+            return "choice"  # onboarding fallback: nothing articulated yet
+        return "free"
+
+    def _next_ladder_stage(self):
+        """Question Priority: Reflective -> Clarifying -> Narrowing -> Action
+        -> Commitment. Never reverses; caps at Commitment."""
+        stage = _QUESTION_LADDER[min(self._ladder_idx, len(_QUESTION_LADDER) - 1)]
+        self._ladder_idx += 1
+        return stage
+
+    def _reset_ladder(self):
+        self._ladder_idx = 0
+
     # ─── mode persistence ──────────────────────────────────────────
 
     def _enter_mode(self, next_mode, by="", force=False):
@@ -700,8 +803,11 @@ class ConversationPlanner:
                     return False
         if next_mode == ConversationMode.DISCOVERY:
             self._discovery_exited = False
-        elif self.mode is not None and self.mode != ConversationMode.DISCOVERY:
-            self._discovery_exited = True
+        else:
+            # Discovery is a one-time phase: leaving it (for any mode) marks
+            # it exited, so a bounce back to discovery states never re-enters.
+            if self.mode is not None:
+                self._discovery_exited = True
         self.mode = next_mode
         self.entered_at = now_iso()
         self.entered_by = by
@@ -718,6 +824,8 @@ class ConversationPlanner:
         decision.mode = self.mode
         decision.next_state = self.mode
         self.last_decision = decision
+        if decision.action not in _ASKING_ACTIONS:
+            self._reset_ladder()
         return decision
 
     # ─── backward compatibility (legacy registry facade) ───────────

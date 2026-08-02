@@ -187,14 +187,21 @@ def test_buttons_and_clicked():
     orch = Orchestrator(user_id=UID, enable_learning=False,
                         enable_auto_judge=False)
     r1 = orch.process_message("hello")
-    options = r1.get("options")
-    assert options, "greeting expected to offer options"
+    assert r1.get("options") is None, \
+        "greeting policy: welcome must not offer category buttons"
+    r2 = orch.process_message("I'm really stressed about work deadlines")
+    assert r2.get("options") is None, \
+        "rich free text always beats buttons"
+    # Button fallback: user expresses uncertainty -> choice buttons appear
+    r3 = orch.process_message("I don't know")
+    options = r3.get("options")
+    assert options, "uncertainty fallback expected to offer options"
     orch.process_message(str(options[0]))
     get_conversation_logger().flush()
     doc = read_json(log_files()[-1])
     t1, t2 = doc["turns"][-2], doc["turns"][-1]  # the two turns just added
     assert t1["buttons_shown"] == options, \
-        "buttons_shown must equal the greeting options"
+        "buttons_shown must equal the fallback options"
     assert t1["button_clicked"] is None  # nothing shown before turn 1
     assert t2["button_clicked"] == str(options[0]), \
         "exact option reply must be recorded as a button click"
