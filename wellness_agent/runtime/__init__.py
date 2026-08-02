@@ -29,6 +29,14 @@ from .diagnostics import DecisionTrace, Diagnostic
 from .engine_metrics import EngineMetrics
 from .engine_result import EngineResult
 from .engine_update import EngineUpdate
+from .intent_resolver import (
+    INTENT_PRIORITIES,
+    Intent,
+    IntentGraph,
+    IntentRelationship,
+    IntentResolverEngine,
+    resolve_intents,
+)
 from .merge_engine import (
     ContextMergeEngine,
     MergeError,
@@ -105,6 +113,11 @@ __all__ = [
     "EventDispatcher",
     "ExecutionContext",
     "HypothesisAdapter",
+    "INTENT_PRIORITIES",
+    "Intent",
+    "IntentGraph",
+    "IntentRelationship",
+    "IntentResolverEngine",
     "LearningAdapter",
     "MemoryAdapter",
     "MemoryContext",

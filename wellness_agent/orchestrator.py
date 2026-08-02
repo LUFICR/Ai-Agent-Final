@@ -1,6 +1,6 @@
 from .agents import AgentRegistry
 from .state_machine import ConversationStateMachine
-from .config import PRODUCT_CONTEXT, APP_NAME
+from .config import PRODUCT_CONTEXT, APP_NAME, PILLARS
 from .utils.storage import load_json, save_json, now_iso
 from .config import get_user_session_path
 from .llm_service import GroqLLM
@@ -8,9 +8,13 @@ from .memory import _CONFIRM_ACCEPT, _CONFIRM_REJECT
 from .reasoning_context import build_reasoning_context
 from .runtime.conversation_engine import ConversationEngine, PersistenceEngine
 from .runtime.conversation_runtime import ConversationRequest, ConversationRuntime
+from .runtime.intent_resolver import IntentResolverEngine
 from .runtime.runtime_orchestrator import RuntimeOrchestrator
+from .conversation_logger import get_conversation_logger
 import itertools
+import logging
 import os
+import time
 from difflib import SequenceMatcher
 
 SHORT_DEFLECTIONS = frozenset([
@@ -57,6 +61,12 @@ _MESSAGE_VARIANTS = {
         "Let's keep it simple — which area matters most right now?",
         "To help point us the right way: which area is heaviest on you today?",
     ],
+    "casual": [
+        "Happy to just chat. What's on your mind?",
+        "Nice — I'm here for that too. Anything else going on with you?",
+        "I'm enjoying this. What else is on your mind?",
+        "Whenever you want to dive into something, I'm here for that too. How's your day going?",
+    ],
     "default": [
         "I hear you. Can you tell me a bit more about that?",
         "Thanks for saying that. Want to unpack it a little more?",
@@ -99,13 +109,18 @@ class Orchestrator:
         self._last_eval = None
         self._register_runtime_engines()
         self.runtime = ConversationRuntime(registry=self.agents.registry)
+        self.conversation_logger = get_conversation_logger()
         self._load_session()
 
     def _register_runtime_engines(self):
-        """Register the M8 runtime engines once into this user's registry.
+        """Register the runtime engines once into this user's registry.
 
-        The conversation engine wraps this Orchestrator's business flow; the
-        RuntimeOrchestrator executes it through the PipelineExecutor.
+        The Intent Resolver 2.0 runs first in the pipeline (RFC-001 Ch2.1)
+        and produces the IntentGraph; the conversation engine wraps this
+        Orchestrator's business flow and consumes the graph; the
+        RuntimeOrchestrator executes the pipeline. The pipeline stages are
+        built here with Orchestrator-aware input builders (memory facts,
+        last turns, active branch) that the generic runtime cannot see.
         """
         registry = self.agents.registry
 
@@ -114,27 +129,97 @@ class Orchestrator:
                 return
             registry.register(engine_id, factory)
 
+        _register("intent_resolver", lambda r: IntentResolverEngine())
         _register("conversation", lambda r: ConversationEngine(self._process_turn))
         _register("persistence", lambda r: PersistenceEngine())
-        _register("runtime_orchestrator", lambda r: RuntimeOrchestrator(registry=r))
+        _register("runtime_orchestrator", lambda r: RuntimeOrchestrator(
+            registry=r, pipeline=self._runtime_stages()))
+
+    def _runtime_stages(self):
+        """Pipeline stage definitions for this Orchestrator's conversation.
+
+        `intent_resolver` runs before `conversation` (RFC-001 Ch2.1
+        execution order); its IntentGraph is merged into the runtime
+        context and passed into the conversation stage input.
+        """
+        from .runtime.pipeline_executor import PipelineStage
+        from .runtime.runtime_engine import RetryPolicy
+
+        def _intent_input(ctx):
+            last_turns = [t for t in (self.last_turns or []) if isinstance(t, dict)]
+            previous = last_turns[-1] if last_turns else {}
+            return {
+                "message": ctx.request.message,
+                "active_branch": ctx.conversation.active_branch
+                or self.current_pillar or "",
+                "previous_question": previous.get("assistant") or "",
+                "last_turns": last_turns[-5:],
+                "memory_facts": self.agents.memory.get_all_facts(),
+                "current_state": self.state_machine.current_state,
+            }
+
+        def _conversation_input(ctx):
+            return {
+                "message": ctx.request.message,
+                "intent_graph": ctx.conversation.intent_graph or {},
+            }
+
+        return [
+            PipelineStage(
+                id="intent_resolver",
+                engine_id="intent_resolver",
+                enabled=True,
+                optional=False,
+                timeout_ms=5000,
+                retry_policy=RetryPolicy(enabled=False, max_retries=0),
+                input_builder=_intent_input,
+            ),
+            PipelineStage(
+                id="conversation",
+                engine_id="conversation",
+                enabled=True,
+                optional=False,
+                timeout_ms=120000,
+                retry_policy=RetryPolicy(enabled=False, max_retries=0),
+                input_builder=_conversation_input,
+            ),
+        ]
 
     def process_message(self, user_message):
         """Public entry point: execute the turn through the ConversationRuntime.
 
         Returns the exact same turn dict the Orchestrator has always
         returned — the runtime owns execution, this method owns nothing.
+        Every turn is recorded to the conversation log asynchronously
+        (logging never affects response generation).
         """
-        response = self.runtime.execute(ConversationRequest(
+        request = ConversationRequest(
             user_id=self.user_id,
             session_id=self.user_id,
             conversation_id=self.user_id,
             message=user_message,
-        ))
-        return response.data
+        )
+        t0 = time.perf_counter()
+        result = self.runtime.execute(request)
+        response_time_ms = (time.perf_counter() - t0) * 1000.0
+        self._log_conversation_turn(request, result, response_time_ms)
+        return result.data
 
-    def _process_turn(self, user_message):
+    def _log_conversation_turn(self, request, result, response_time_ms):
+        """Record the turn to the conversation log; never breaks the chat."""
+        try:
+            self.conversation_logger.record_runtime_turn(
+                context=result.context, orch=self,
+                response_time_ms=response_time_ms)
+        except Exception:  # noqa: BLE001 — logging must never affect the turn
+            logging.getLogger("wellness_agent").warning(
+                "conversation logging failed", exc_info=True)
+
+    def _process_turn(self, user_message, intent_graph=None):
+        self._last_user_message = user_message
         turn_result = {
             "user_message": user_message,
+            "intent_graph": intent_graph or {},
             "risk_detected": False,
             "emotion": None,
             "state": None,
@@ -157,6 +242,9 @@ class Orchestrator:
             turn_result["response"] = self._risk_response(emotion.get("risk_reason", ""))
             turn_result["state"] = self.state_machine.get_state_info()
             turn_result["reasoning_context"] = self._build_reasoning_context(emotion, risk_flag=True)
+            turn_result["planner_decision"] = self.agents.planner.decide(
+                self._planner_context(["risk_protocol"], emotion,
+                                      turn_result.get("intent_graph", {}))).to_dict()
             self._save_turn(user_message, turn_result)
             self._maybe_debug(turn_result)
             return turn_result
@@ -164,8 +252,6 @@ class Orchestrator:
         # ─── Self evaluation (deterministic): did the PREVIOUS response achieve its objective? ───
         self._evaluate_previous_turn(user_message, emotion)
         turn_result["self_evaluation"] = self._last_eval
-
-        self._last_user_message = user_message
 
         # ─── Hard Avoidance Counter (deterministic, not LLM) ───
         if user_message.strip():
@@ -217,6 +303,10 @@ class Orchestrator:
                     turn_result["response"] = "Sounds good — I'll check in tomorrow. Take care."
                     turn_result["state"] = self.state_machine.get_state_info()
                     turn_result["reasoning_context"] = self._build_reasoning_context(emotion)
+                    turn_result["planner_decision"] = {
+                        "action": "close_conversation", "mode": "closure",
+                        "reason": "user accepted the exit offer", "confidence": 0.9,
+                        "next_state": None, "metadata": {}}
                     self._save_turn(user_message, turn_result)
                     self._maybe_debug(turn_result)
                     return turn_result
@@ -225,6 +315,10 @@ class Orchestrator:
                     turn_result["options"] = ["Talk about something", "Just chat", "Maybe later"]
                     turn_result["state"] = self.state_machine.get_state_info()
                     turn_result["reasoning_context"] = self._build_reasoning_context(emotion)
+                    turn_result["planner_decision"] = {
+                        "action": "casual_chat", "mode": "casual_chat",
+                        "reason": "user declined the exit offer", "confidence": 0.8,
+                        "next_state": None, "metadata": {}}
                     self._save_turn(user_message, turn_result)
                     self._maybe_debug(turn_result)
                     return turn_result
@@ -252,6 +346,10 @@ class Orchestrator:
                     turn_result["options"] = None
                     turn_result["state"] = self.state_machine.get_state_info()
                     turn_result["reasoning_context"] = self._build_reasoning_context(emotion)
+                    turn_result["planner_decision"] = {
+                        "action": "confirm_understanding", "mode": None,
+                        "reason": "memory confirmation resolved", "confidence": 0.9,
+                        "next_state": None, "metadata": {}}
                     self._save_turn(user_message, turn_result)
                     self._maybe_debug(turn_result)
                     return turn_result
@@ -307,8 +405,14 @@ class Orchestrator:
         # 7. reasoning context — fused engine state, assembled before prompting
         self._build_reasoning_context(emotion)
 
+        # 7b. Conversation Planner V2 — the single decision engine:
+        #     every response originates from exactly one PlannerAction
+        decision = self.agents.planner.decide(
+            self._planner_context(route, emotion, turn_result.get("intent_graph", {})))
+        turn_result["planner_decision"] = decision.to_dict()
+
         # 8. LLM generates natural language only, given the context
-        resp_data = self._generate_response(route, emotion, user_message, self.reasoning_ctx)
+        resp_data = self._generate_response(route, emotion, user_message, self.reasoning_ctx, decision)
 
         # ─── Memory confirmation: append question or ack (deterministic) ───
         conf = turn_result.get("confirmation")
@@ -512,191 +616,105 @@ class Orchestrator:
 
         return route
 
+    # ─── Conversation Planner V2: deterministic decision context ───
+
+    def _planner_context(self, route, emotion, intent_graph):
+        msg = self._last_user_message or ""
+        msg_lower = msg.strip().lower()
+        emotion_words = set(["sad", "lonely", "down", "tired", "anxious",
+                             "stressed", "overwhelm", "burnout"])
+        return {
+            "message": msg,
+            "intent_graph": intent_graph or {},
+            "emotion": emotion or {},
+            "state": self.state_machine.current_state,
+            "state_info": self.state_machine.get_state_info(),
+            "route": list(route),
+            "current_pillar": self.current_pillar,
+            "objective": (self.current_objective or {}).get("objective"),
+            "avoidance_count": self.avoidance_count,
+            "exit_offered": self._exit_offered,
+            "exit_consumed": self._exit_consumed,
+            "minimal_input": not msg.strip() or len(msg.strip().split()) < 3,
+            "has_emotion_keyword": any(w in msg_lower for w in emotion_words),
+        }
+
     # ─── Response Generation (LLM-enhanced) ───────────────────
 
-    def _generate_response(self, route, emotion, user_message, reasoning_ctx=None):
+    def _generate_response(self, route, emotion, user_message, reasoning_ctx=None, decision=None):
+        """Execute the planner's decision — every response originates from one PlannerAction."""
         state = self.state_machine.current_state
-        objective = (self.current_objective or {}).get("objective")
-        text = ""
-        options = None
+        action = (decision.action.value if decision else None) or "ask_question"
+        meta = (decision.metadata or {}) if decision else {}
 
-        # ─── Ranked interventions: user asked for more (deterministic) ───
+        # ─── Ranked interventions: user asked for more (deterministic rail) ───
         more = self._next_intervention_response(user_message)
         if more:
-            return more
-
-        if state == "greeting":
-            session_num = self.agents.memory.memory.get("session_count", 1)
-            known = self.agents.memory.get_known_pillars()
-            opts = self.agents.question_planner.generate_question(
-                "mood", "greeting", memory_context={})
-            options = opts.get("options") or opts.get("response_options")
-            proactive = self._proactive_checkin()
-            if proactive and session_num > 1:
-                text = proactive["question"]
-            elif session_num <= 1:
-                text = "Hey there. I'm your wellness companion. I'm here to help you understand yourself better — no judgment, no agenda. How are you feeling today?"
+            resp = more
+        elif action == "escalate":
+            resp = {"text": self._risk_response(meta.get("risk_reason", "")), "options": None}
+        elif action == "answer_capability":
+            resp = self._capability_response()
+        elif action == "answer_direct_question":
+            resp = self._answer_direct_question(user_message)
+        elif action == "switch_topic":
+            resp = self._switch_topic_response(decision)
+        elif action == "resume_topic":
+            resp = self._resume_topic_response(decision, emotion, reasoning_ctx)
+        elif action == "create_commitment":
+            resp = self._commitment_response()
+        elif action == "schedule_action":
+            resp = self._scheduling_response()
+        elif action == "close_conversation":
+            resp = self._close_response(meta)
+        elif action == "summarize":
+            resp = self._summarize_response()
+        elif action == "check_progress":
+            resp = self._follow_up_response()
+        elif action == "reflect":
+            resp = self._reflection_response()
+        elif action == "casual_chat":
+            resp = self._casual_chat_response(meta, state)
+        elif action == "wait":
+            resp = self._wait_response(meta)
+        elif action == "clarify":
+            if meta.get("force_choice"):
+                resp = self._force_choice_response()
+            elif meta.get("quick_tree"):
+                resp = self._quick_tree_response(user_message)
             else:
-                pillars_known = list(known.keys())
-                if pillars_known:
-                    text = f"Welcome back. Last time we touched on {pillars_known[0]}. How have things been since we talked?"
-                else:
-                    text = "Welcome back. I'm glad you're here. What's on your mind today?"
-            return {"text": text, "options": options}
-
-        elif "question_planner" in route and self.avoidance_count == 1 and not self._exit_consumed:
-            # Force choice with concrete options (never re-ask open-ended)
-            text = "Which of these areas feels most relevant right now?"
-            base = ["😴 Sleep", "💼 Work", "💛 Relationships", "😰 Stress"]
-            if self.current_pillar:
-                highlighted = [p.title() for p in [self.current_pillar] if p]
-                others = [b for b in base if b.split()[1].lower() != (self.current_pillar or "").lower()][:2]
-                options = highlighted + others + ["Something else", "Let me explain"]
+                resp = self._question_response(emotion, reasoning_ctx)
+        elif action == "confirm_understanding":
+            resp = self._confirm_response(decision, user_message)
+        elif action == "provide_insight":
+            if meta.get("insight"):
+                resp = self._insight_response()
             else:
-                options = base + ["Something else", "Let me explain"]
-
-        elif self.avoidance_count >= 3 and not self._exit_offered and not self._exit_consumed:
-            text = "Totally okay — I'm here whenever you want to dig into something. Want me to just check in tomorrow instead?"
-            options = ["Yes", "No"]
-            self._exit_offered = True
-
-        elif state == "rapport_building" and self.avoidance_count == 2 and not self._exit_consumed:
-            text = "No pressure at all. Want to just chat about your day instead?"
-            options = ["Sure", "Not really", "Maybe later"]
-
-        # Hierarchical category tree (minimal talk, high-level choices)
-        minimal_input = not user_message.strip() or len(user_message.strip().split()) < 3
-        emotion_words = set(["sad", "lonely", "down", "tired", "anxious", "stressed", "overwhelm", "burnout"])
-        msg_lower = user_message.strip().lower()
-        has_emotion_keyword = any(word in msg_lower for word in emotion_words)
-        # Only trigger quick tree when NOT in greeting (smart timing), or when user is clearly stuck/emotional
-        sub_categories = {
-            "mental": ["sadness / low mood", "loneliness", "anxiety / worry", "motivation gap"],
-            "productivity": ["overwhelm", "procrastination", "focus / distraction", "work-life balance"],
-            "physical": ["sleep", "energy / fatigue", "movement / exercise", "nutrition"],
-        }
-        selected_sub = None
-        selected_category = None
-        # Detect sub-category selection (with fuzzy matching)
-        def _fuzzy_match(word, targets, threshold=0.6):
-            word = word.strip().lower()
-            for t in targets:
-                t_clean = t.strip().lower()
-                if word == t_clean:
-                    return t
-                if len(word) > 2 and word[0] == t_clean[:1]:
-                    ratio = SequenceMatcher(None, word, t_clean).ratio()
-                    if ratio >= threshold:
-                        return t
-            return None
-
-        for cat, subs in sub_categories.items():
-            for sub in subs:
-                # Try exact match first (e.g., "anxiety / worry" in msg_lower)
-                if sub in msg_lower:
-                    selected_sub = sub
-                    selected_category = cat
-                    break
-                # Try fuzzy match on individual words
-                for word in msg_lower.split():
-                    matched = _fuzzy_match(word, [sub.split(" / ")[0], sub], threshold=0.55)
-                    if matched:
-                        selected_sub = sub
-                        selected_category = cat
-                        break
-                if selected_sub:
-                    break
-            if selected_sub:
-                break
-        if state != "greeting" and (minimal_input or has_emotion_keyword):
-            # If user just selected a sub-category, treat as engagement, not avoidance
-            if selected_sub:
-                self.avoidance_count = 0
-                self._exit_offered = False
-                self.current_pillar = selected_sub
-                self.state_machine.current_state = "deep_investigation"
-                text = f"Got it — let's focus on {selected_sub}. What's been showing up for you around that?"
-                options = ["Every day", "A few times a week", "Rarely", "Not sure yet"]
-                return {"text": text, "options": options}
-            # Otherwise show top-level categories (with fuzzy matching)
-            productivity_keywords = ["productivity", "focus", "procrastination", "work", "overwhelm", "work-life"]
-            physical_keywords = ["physical", "sleep", "energy", "exercise", "movement", "nutrition"]
-            mental_keywords = ["mental", "sad", "lonely", "anxiety", "motivation", "gap", "sadness", "loneliness"]
-            def _any_match(words, keywords):
-                for w in words:
-                    if _fuzzy_match(w, keywords, threshold=0.55):
-                        return True
-                return False
-            msg_words = msg_lower.split()
-            if _any_match(msg_words, productivity_keywords):
-                text = "Within productivity, which fits best?"
-                options = ["Overwhelm", "Procrastination", "Focus / Distraction", "Work-life balance"]
-            elif _any_match(msg_words, physical_keywords):
-                text = "Within physical health, which fits best?"
-                options = ["Sleep", "Energy / Fatigue", "Movement / Exercise", "Nutrition"]
-            elif _any_match(msg_words, mental_keywords):
-                text = "Within mental wellness, which fits best?"
-                options = ["Sadness / Low mood", "Loneliness", "Anxiety / Worry", "Motivation gap"]
+                resp = self._insight_variant_response()
+        elif action == "provide_recommendation":
+            resp = self._routine_response()
+        elif action == "ask_question":
+            if meta.get("greeting"):
+                resp = self._greeting_response()
+            elif meta.get("soft"):
+                resp = self._soft_response()
+            elif meta.get("default"):
+                resp = self._default_response()
             else:
-                text = next(self._response_cyclers["quick_path"])
-                options = ["Productivity", "Physical health", "Mental wellness"]
-            return {"text": text, "options": options}
-
-        elif "question_planner" in route:
-            q_data = self._generate_question(emotion, reasoning_ctx)
-            text = q_data["question_text"]
-            options = q_data.get("response_options")
-
-        elif "root_cause_engine" in route and self.current_pillar and "question_planner" not in route:
-            text = self._generate_insight()
-            options = ["Yes, that's it", "Partly", "Not quite"]
-
-        elif "routine_generator" in route:
-            text = self._generate_routine_suggestion()
-            options = self._intervention_options()
-
-        elif objective == "close_conversation" and state not in ("greeting",):
-            text = "I'm glad you checked in. Let's leave it here for today — I'll be here whenever you need me. Anything you want to take with you from this conversation?"
-            options = ["Good for today", "One more thing"]
-
-        elif state == "reflection":
-            llm_close = self.llm.generate_reflection(
-                self.state_machine.get_state_info(), self.last_turns)
-            text = llm_close or self.agents.reflection_response(self.state_machine.get_state_info())
-            options = ["Good for today", "One more thing"]
-
-        elif state == "follow_up":
-            text = next(self._response_cyclers["follow_up"])
-            options = ["Better", "Same", "Rougher"]
-
-        elif state == "free_conversation":
-            text = next(self._response_cyclers["free_conversation"])
-            options = None
-
-        elif state == "rapport_building":
-            text = next(self._response_cyclers["rapport_building"])
-            options = ["🙂 Good", "😑 Meh", "Rough one"]
-
-        elif state == "avoidance_detection":
-            text = next(self._response_cyclers["avoidance_detection"])
-            options = ["Keep talking", "Switch topics", "Check in later"]
-
-        elif state == "soft_exploration":
-            text = next(self._response_cyclers["soft_exploration"])
-            options = ["A specific thing", "Just talking helps", "Not sure yet"]
-
-        elif state == "insight_generation":
-            text = next(self._response_cyclers["insight_generation"])
-            options = ["Yes, that's it", "Partly", "Not quite"]
-
+                resp = self._question_response(emotion, reasoning_ctx)
+        elif action == "explore_topic":
+            resp = self._question_response(emotion, reasoning_ctx)
         else:
             import logging
             logging.warning(
-                f"[UNHANDLED ROUTE] No matching response handler for state='{state}' "
-                f"route={route} user={user_message!r}"
+                f"[UNHANDLED ACTION] No response handler for action={action} "
+                f"state={state} user={user_message!r}"
             )
-            text = next(self._response_cyclers["default"])
-            options = None
+            resp = self._default_response()
+
+        resp["action"] = action
+        text = resp.get("text", "")
+        options = resp.get("options")
 
         # ─── Repetition safeguard ───
         if text == self._last_response_text and state == self._last_response_state:
@@ -713,24 +731,318 @@ class Orchestrator:
                 self._repeat_count = 0
                 self._last_response_text = text
                 self._last_response_state = "free_conversation"
-                return {"text": text, "options": options}
-            import logging
-            logging.warning(
-                f"[REPEAT] State '{state}' produced verbatim repeat #{self._repeat_count} "
-                f"(user: {user_message!r}) — route was {route}"
-            )
-            # Force a variant from a different tone to break the loop
-            forced = next(self._response_cyclers.get(state, self._response_cyclers["default"]))
-            if forced != text:
-                text = forced
             else:
-                text = next(self._response_cyclers["default"])
+                import logging
+                logging.warning(
+                    f"[REPEAT] State '{state}' produced verbatim repeat #{self._repeat_count} "
+                    f"(user: {user_message!r}) — route was {route}"
+                )
+                # Force a variant from a different tone to break the loop
+                forced = next(self._response_cyclers.get(state, self._response_cyclers["default"]))
+                if forced != text:
+                    text = forced
+                else:
+                    text = next(self._response_cyclers["default"])
         else:
             self._repeat_count = 0
             self._last_response_text = text
             self._last_response_state = state
 
+        resp["text"] = text
+        resp["options"] = options
+        return resp
+
+    # ─── Decision executors (each maps one PlannerAction to a response) ───
+
+    def _greeting_response(self):
+        session_num = self.agents.memory.memory.get("session_count", 1)
+        known = self.agents.memory.get_known_pillars()
+        opts = self.agents.question_planner.generate_question(
+            "mood", "greeting", memory_context={})
+        options = opts.get("options") or opts.get("response_options")
+        proactive = self._proactive_checkin()
+        if proactive and session_num > 1:
+            text = proactive["question"]
+        elif session_num <= 1:
+            text = "Hey there. I'm your wellness companion. I'm here to help you understand yourself better — no judgment, no agenda. How are you feeling today?"
+        else:
+            pillars_known = list(known.keys())
+            if pillars_known:
+                text = f"Welcome back. Last time we touched on {pillars_known[0]}. How have things been since we talked?"
+            else:
+                text = "Welcome back. I'm glad you're here. What's on your mind today?"
         return {"text": text, "options": options}
+
+    def _force_choice_response(self):
+        text = "Which of these areas feels most relevant right now?"
+        base = ["😴 Sleep", "💼 Work", "💛 Relationships", "😰 Stress"]
+        if self.current_pillar:
+            highlighted = [p.title() for p in [self.current_pillar] if p]
+            others = [b for b in base if b.split()[1].lower() != (self.current_pillar or "").lower()][:2]
+            options = highlighted + others + ["Something else", "Let me explain"]
+        else:
+            options = base + ["Something else", "Let me explain"]
+        return {"text": text, "options": options}
+
+    def _exit_offer_response(self):
+        text = "Totally okay — I'm here whenever you want to dig into something. Want me to just check in tomorrow instead?"
+        options = ["Yes", "No"]
+        self._exit_offered = True
+        return {"text": text, "options": options}
+
+    def _casual_offer_response(self):
+        text = "No pressure at all. Want to just chat about your day instead?"
+        options = ["Sure", "Not really", "Maybe later"]
+        return {"text": text, "options": options}
+
+    def _quick_tree_response(self, user_message):
+        state = self.state_machine.current_state
+        # Hierarchical category tree (minimal talk, high-level choices)
+        msg_lower = user_message.strip().lower()
+        sub_categories = {
+            "mental": ["sadness / low mood", "loneliness", "anxiety / worry", "motivation gap"],
+            "productivity": ["overwhelm", "procrastination", "focus / distraction", "work-life balance"],
+            "physical": ["sleep", "energy / fatigue", "movement / exercise", "nutrition"],
+        }
+        selected_sub = None
+        selected_category = None
+
+        def _fuzzy_match(word, targets, threshold=0.6):
+            word = word.strip().lower()
+            for t in targets:
+                t_clean = t.strip().lower()
+                if word == t_clean:
+                    return t
+                if len(word) > 2 and word[0] == t_clean[:1]:
+                    ratio = SequenceMatcher(None, word, t_clean).ratio()
+                    if ratio >= threshold:
+                        return t
+            return None
+
+        for cat, subs in sub_categories.items():
+            for sub in subs:
+                if sub in msg_lower:
+                    selected_sub = sub
+                    selected_category = cat
+                    break
+                for word in msg_lower.split():
+                    matched = _fuzzy_match(word, [sub.split(" / ")[0], sub], threshold=0.55)
+                    if matched:
+                        selected_sub = sub
+                        selected_category = cat
+                        break
+                if selected_sub:
+                    break
+            if selected_sub:
+                break
+        # If user just selected a sub-category, treat as engagement, not avoidance
+        if selected_sub:
+            self.avoidance_count = 0
+            self._exit_offered = False
+            self.current_pillar = selected_sub
+            self.state_machine.current_state = "deep_investigation"
+            text = f"Got it — let's focus on {selected_sub}. What's been showing up for you around that?"
+            options = ["Every day", "A few times a week", "Rarely", "Not sure yet"]
+            return {"text": text, "options": options}
+        # Otherwise show top-level categories (with fuzzy matching)
+        productivity_keywords = ["productivity", "focus", "procrastination", "work", "overwhelm", "work-life"]
+        physical_keywords = ["physical", "sleep", "energy", "exercise", "movement", "nutrition"]
+        mental_keywords = ["mental", "sad", "lonely", "anxiety", "motivation", "gap", "sadness", "loneliness"]
+
+        def _any_match(words, keywords):
+            for w in words:
+                if _fuzzy_match(w, keywords, threshold=0.55):
+                    return True
+            return False
+
+        msg_words = msg_lower.split()
+        if _any_match(msg_words, productivity_keywords):
+            text = "Within productivity, which fits best?"
+            options = ["Overwhelm", "Procrastination", "Focus / Distraction", "Work-life balance"]
+        elif _any_match(msg_words, physical_keywords):
+            text = "Within physical health, which fits best?"
+            options = ["Sleep", "Energy / Fatigue", "Movement / Exercise", "Nutrition"]
+        elif _any_match(msg_words, mental_keywords):
+            text = "Within mental wellness, which fits best?"
+            options = ["Sadness / Low mood", "Loneliness", "Anxiety / Worry", "Motivation gap"]
+        else:
+            text = next(self._response_cyclers["quick_path"])
+            options = ["Productivity", "Physical health", "Mental wellness"]
+        return {"text": text, "options": options}
+
+    def _question_response(self, emotion, reasoning_ctx):
+        q_data = self._generate_question(emotion, reasoning_ctx)
+        return {"text": q_data["question_text"], "options": q_data.get("response_options")}
+
+    def _insight_response(self):
+        return {"text": self._generate_insight(), "options": ["Yes, that's it", "Partly", "Not quite"]}
+
+    def _insight_variant_response(self):
+        return {"text": next(self._response_cyclers["insight_generation"]),
+                "options": ["Yes, that's it", "Partly", "Not quite"]}
+
+    def _routine_response(self):
+        return {"text": self._generate_routine_suggestion(), "options": self._intervention_options()}
+
+    def _close_response(self, meta=None):
+        meta = meta or {}
+        if meta.get("commitment_done"):
+            return {"text": "Perfect — that's a plan. I'll check in on how it goes. Take care until then.",
+                    "options": None}
+        if meta.get("graceful"):
+            return {"text": "No worries at all — I'll be here whenever you're ready. Take care.",
+                    "options": None}
+        text = "I'm glad you checked in. Let's leave it here for today — I'll be here whenever you need me. Anything you want to take with you from this conversation?"
+        return {"text": text, "options": ["Good for today", "One more thing"]}
+
+    def _reflection_response(self):
+        llm_close = self.llm.generate_reflection(
+            self.state_machine.get_state_info(), self.last_turns)
+        text = llm_close or self.agents.reflection_response(self.state_machine.get_state_info())
+        return {"text": text, "options": ["Good for today", "One more thing"]}
+
+    def _follow_up_response(self):
+        return {"text": next(self._response_cyclers["follow_up"]), "options": ["Better", "Same", "Rougher"]}
+
+    def _free_conversation_response(self):
+        return {"text": next(self._response_cyclers["free_conversation"]), "options": None}
+
+    def _rapport_response(self):
+        return {"text": next(self._response_cyclers["rapport_building"]),
+                "options": ["🙂 Good", "😑 Meh", "Rough one"]}
+
+    def _avoidance_response(self):
+        return {"text": next(self._response_cyclers["avoidance_detection"]),
+                "options": ["Keep talking", "Switch topics", "Check in later"]}
+
+    def _soft_response(self):
+        return {"text": next(self._response_cyclers["soft_exploration"]),
+                "options": ["A specific thing", "Just talking helps", "Not sure yet"]}
+
+    def _default_response(self):
+        return {"text": next(self._response_cyclers["default"]), "options": None}
+
+    def _casual_chat_response(self, meta, state):
+        if meta.get("casual_offer"):
+            return self._casual_offer_response()
+        if meta.get("rapport"):
+            return self._rapport_response()
+        if state == "free_conversation":
+            return self._free_conversation_response()
+        return {"text": next(self._response_cyclers["casual"]), "options": None}
+
+    def _wait_response(self, meta):
+        if meta.get("exit_offer"):
+            return self._exit_offer_response()
+        if meta.get("avoidance"):
+            return self._avoidance_response()
+        if meta.get("commitment_pause"):
+            return {"text": "No rush at all — just let me know whenever you've decided.", "options": None}
+        if meta.get("loop_break"):
+            return {"text": "Let's try a different angle. What's one thing you'd like help with today?",
+                    "options": ["My mood", "My habits", "My thoughts", "Not sure"]}
+        return {"text": "I'm here. Take your time — whenever you're ready, we can pick this back up.",
+                "options": None}
+
+    def _confirm_response(self, decision, user_message):
+        text = f"So to make sure I've got it right — {user_message.strip()}. Is that the gist?"
+        return {"text": text, "options": ["Yes", "Partly", "Not quite"]}
+
+    def _capability_response(self):
+        text = ("Here's what I can help with: sleep, stress, work and life balance, "
+                "relationships, mood, motivation, exercise, routines, nutrition, and finances. "
+                "We can explore what's going on, spot patterns across your habits, and take "
+                "small next steps together. What would be most helpful right now?")
+        return {"text": text, "options": None}
+
+    def _answer_direct_question(self, user_message):
+        llm_answer = self.llm.generate_answer(user_message, self._answer_context()) \
+            if self.llm.is_available() else ""
+        if llm_answer:
+            return {"text": llm_answer, "options": None}
+        return {"text": self._rule_answer(), "options": None}
+
+    def _answer_context(self):
+        why = self.agents.why_engine.get_top()
+        hyps = self.agents.hypothesis_engine.get_active(min_confidence=50)[:3]
+        return {
+            "pillar": self.current_pillar,
+            "state": self.state_machine.current_state,
+            "facts": self.agents.memory.get_all_facts()[-8:],
+            "pattern": why.get("human") if why else None,
+            "pattern_repeats": why.get("repeats", 1) if why else None,
+            "hypotheses": [h.get("hypothesis") for h in hyps],
+            "trust_score": self.agents.memory.get_trust_score(),
+        }
+
+    def _rule_answer(self):
+        why = self.agents.why_engine.get_top()
+        if why and why.get("human"):
+            return (f"Here's what stands out from what you've shared: {why['human']}. "
+                    f"It looks like this has shown up {why.get('repeats', 1)} times now — "
+                    f"want to look at what's driving it together?")
+        hyps = self.agents.hypothesis_engine.get_active(min_confidence=50)
+        if hyps:
+            hypothesis = hyps[0]["hypothesis"]
+            return (f"Based on what you've told me, the pattern I'm noticing most is around "
+                    f"{hypothesis.lower()}. It's not a diagnosis — just a thread worth pulling. "
+                    f"Want to explore it together?")
+        facts = self.agents.memory.get_all_facts()
+        if facts:
+            top = "; ".join(f"{f.get('key')}={f.get('value')}" for f in facts[-3:])
+            return (f"From what you've shared so far — {top} — these things usually feed each "
+                    f"other. Want to look at which one is heaviest for you right now?")
+        return ("That's a fair question, and I don't want to guess. The honest answer is that "
+                "these feelings usually come from a mix of sleep, stress, and routine — but yours "
+                "could be different. Want to look at what's most relevant for you?")
+
+    def _switch_topic_response(self, decision):
+        meta = decision.metadata or {}
+        target = meta.get("target_topic")
+        if target in PILLARS and target != self.current_pillar:
+            self.current_pillar = target
+            self.state_machine.select_pillar(target)
+            self.agents.question_planner.reset_deep_count()
+        if target:
+            text = f"Happy to switch gears. What's been going on with {target}?"
+        else:
+            text = "Happy to switch gears. What's on your mind now?"
+        return {"text": text, "options": None}
+
+    def _resume_topic_response(self, decision, emotion, reasoning_ctx):
+        target = (decision.metadata or {}).get("target_topic")
+        if target in PILLARS and target != self.current_pillar:
+            self.current_pillar = target
+            self.state_machine.select_pillar(target)
+            self.agents.question_planner.reset_deep_count()
+        q_data = self._generate_question(emotion, reasoning_ctx)
+        if self.current_pillar:
+            q_data = dict(q_data)
+            q_data["question_text"] = f"Back to what we were exploring — {q_data['question_text']}"
+        return {"text": q_data["question_text"], "options": q_data.get("response_options")}
+
+    def _commitment_response(self):
+        rec = self._ranked_interventions[0] if self._ranked_interventions else {}
+        action_text = rec.get("action", "that step")
+        text = (f"That's a great choice. To make it stick, one small commitment is enough: "
+                f"{action_text}. Would tomorrow morning be a good time to try this?")
+        return {"text": text, "options": ["Tomorrow morning", "Tonight", "This weekend", "Not right now"]}
+
+    def _scheduling_response(self):
+        return {"text": "Great — what time of day would work best for you to actually do it?",
+                "options": ["Morning", "Midday", "Evening", "Anytime"]}
+
+    def _summarize_response(self):
+        pillar = self.current_pillar or "what we explored"
+        facts = self.agents.memory.get_facts_by_pillar(self.current_pillar)[-3:] \
+            if self.current_pillar else []
+        summary = ""
+        if facts:
+            summary = " " + "; ".join(f"{f.get('key')}={f.get('value')}" for f in facts)
+        text = (f"Today we explored {pillar}{summary}. "
+                f"Whenever you're ready, we can pick this back up — or close here for now. "
+                f"Want to keep going?")
+        return {"text": text, "options": ["Good for today", "One more thing"]}
 
     # ─── LLM-Integrated Phase 7: Questions ────────────────────
 
@@ -1217,6 +1529,8 @@ class Orchestrator:
         self._last_response_state = None
         self._repeat_count = 0
         self._response_cyclers = {k: itertools.cycle(v) for k, v in _MESSAGE_VARIANTS.items()}
+        self.agents.planner.reset()
         self.agents.self_evaluator.reset()
         self._last_turn = None
+        self.conversation_logger.end_conversation(self.user_id)
         self._last_eval = None

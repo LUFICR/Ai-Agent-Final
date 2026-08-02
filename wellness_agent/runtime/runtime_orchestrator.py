@@ -37,9 +37,11 @@ from .runtime_context import (
 from .runtime_engine import RetryPolicy
 
 # Default reasoning pipeline (M8 spec Ch2 Engine Scheduling). The existing
-# deterministic conversation flow is wrapped as ONE registered engine
-# ("conversation") so behavior stays byte-identical; the pipeline remains
-# deterministic and extendable into per-engine stages in later migrations.
+# M8 contract (unchanged): the deterministic conversation flow is wrapped
+# as ONE registered engine ("conversation") so behavior stays byte-identical.
+# The AI Intelligence phase adds the Intent Resolver 2.0 stage through the
+# Orchestrator's own pipeline definition (see Orchestrator._runtime_stages),
+# keeping the runtime default identical to M8.
 _DEFAULT_STAGES = (
     PipelineStage(
         id="conversation",
@@ -182,12 +184,18 @@ class RuntimeOrchestrator:
                 self._registry, self._pipeline,
                 on_event=lambda event: dispatcher.emit(
                     event.event_type, event.engine_id, event.message))
-            for stage_result in executor.execute(
-                    {"message": context.request.message}, context):
-                context = self._merge_stage(context, stage_result, dispatcher,
-                                            metrics)
-                context = self._merge_runtime_metrics(context, dispatcher,
-                                                      metrics)
+            # Run stages one at a time and merge each stage's update before
+            # the next stage's input_builder runs — later stages must see
+            # earlier stages' context writes (e.g. the intent_resolver's
+            # IntentGraph when the conversation stage builds its input).
+            for stage in executor.stages:
+                for stage_result in executor.execute(
+                        {"message": context.request.message}, context,
+                        stages=[stage]):
+                    context = self._merge_stage(context, stage_result,
+                                                dispatcher, metrics)
+                    context = self._merge_runtime_metrics(context, dispatcher,
+                                                          metrics)
 
             # Streaming window (M8 spec Ch2 execution pipeline).
             context = self._merge.transition(context, RuntimeState.STREAMING)

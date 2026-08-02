@@ -13,6 +13,8 @@ memory facts, reports) continue to happen inside the conversation flow, so
 this stage never duplicates writes.
 """
 
+import inspect
+
 from .diagnostics import Diagnostic
 from .engine_update import EngineUpdate
 from .runtime_engine import BaseEngine, EngineCategory, EngineMetadata
@@ -39,10 +41,25 @@ class ConversationEngine(BaseEngine):
         )
 
     def _invoke(self, engine_input, context):
-        message = (engine_input or {}).get("message", "")
-        turn = self._process_turn(message)
+        engine_input = engine_input or {}
+        message = engine_input.get("message", "")
+        intent_graph = engine_input.get("intent_graph") or {}
+        if self._accepts_intent_graph():
+            turn = self._process_turn(message, intent_graph=intent_graph)
+        else:
+            turn = self._process_turn(message)
         return EngineUpdate.success({"turn": turn if isinstance(turn, dict)
                                      else {"response": str(turn)}})
+
+    def _accepts_intent_graph(self):
+        """True when the wrapped flow accepts the optional `intent_graph`
+        kwarg (AI Intelligence wiring); M8-style 1-arg wrappers keep their
+        exact behavior."""
+        try:
+            return "intent_graph" in inspect.signature(
+                self._process_turn).parameters
+        except (ValueError, TypeError):
+            return False
 
 
 class PersistenceEngine(BaseEngine):

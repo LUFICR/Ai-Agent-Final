@@ -39,7 +39,9 @@ class ConversationResponse:
 
     `data` carries the full turn result (the same dict the Orchestrator has
     always returned); `message` is the assistant text; diagnostics and
-    metrics are attached for observability.
+    metrics are attached for observability. `context` exposes the final
+    request-scoped RuntimeContext (lifecycle, history, diagnostics) for
+    logging/replay purposes — read-only, never cached.
     """
 
     response_id: str
@@ -47,6 +49,7 @@ class ConversationResponse:
     data: dict = field(default_factory=dict)
     diagnostics: object = None
     metrics: object = None
+    context: object = None
 
 
 class ConversationRuntime:
@@ -90,13 +93,15 @@ class ConversationRuntime:
         result = orchestrator.execute(context)
 
         # The orchestrator disposes the context (ends DISPOSED); nothing
-        # request-scoped survives here.
+        # request-scoped survives here. The context itself is exposed
+        # read-only on the response for the conversation logger.
         return ConversationResponse(
             response_id=result.context.request.request_id,
             message=(result.context.conversation.turn or {}).get("response", ""),
             data=result.context.conversation.turn or {},
             diagnostics=result.context.diagnostics,
             metrics=result.context.metrics,
+            context=result.context,
         )
 
 

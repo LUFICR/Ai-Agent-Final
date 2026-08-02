@@ -144,6 +144,22 @@ Output JSON only matching the full schema."""
         raw = self._call(self.EMOTION_SYSTEM, inp, temperature=0.1)
         return self._extract_json(raw)
 
+    # ─── Phase 6/7: Direct Answer (Conversation Planner V2) ───
+
+    ANSWER_SYSTEM = """You answer a direct user question about their wellbeing. Rules:
+1. Ground the answer ONLY in the provided context (facts, patterns, hypotheses).
+2. Never diagnose, never invent facts, never give medical advice.
+3. Be warm, honest, and 1-4 sentences.
+4. If the context gives no basis for an answer, say so plainly and offer to explore together.
+
+Output plain text only, no JSON."""
+
+    def generate_answer(self, user_message: str, answer_context: dict) -> str:
+        if not self.is_available():
+            return ""
+        inp = json.dumps({"user_message": user_message, "context": answer_context})
+        return self._call(self.ANSWER_SYSTEM, inp, temperature=0.4, max_tokens=256)
+
     # ─── Phase 6/7: Question Generation ───────────────────────
 
     QUESTION_SYSTEM = """You write the next question to ask the user, given a target topic and conversation state. Match tone to state — warmer in Rapport Building, more direct in Deep Investigation.
