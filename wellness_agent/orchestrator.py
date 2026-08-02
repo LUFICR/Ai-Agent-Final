@@ -6,6 +6,9 @@ from .config import get_user_session_path
 from .llm_service import GroqLLM
 from .memory import _CONFIRM_ACCEPT, _CONFIRM_REJECT
 from .reasoning_context import build_reasoning_context
+from .runtime.conversation_engine import ConversationEngine, PersistenceEngine
+from .runtime.conversation_runtime import ConversationRequest, ConversationRuntime
+from .runtime.runtime_orchestrator import RuntimeOrchestrator
 import itertools
 import os
 from difflib import SequenceMatcher
@@ -94,9 +97,42 @@ class Orchestrator:
         self.reasoning_ctx = None
         self._last_turn = None
         self._last_eval = None
+        self._register_runtime_engines()
+        self.runtime = ConversationRuntime(registry=self.agents.registry)
         self._load_session()
 
+    def _register_runtime_engines(self):
+        """Register the M8 runtime engines once into this user's registry.
+
+        The conversation engine wraps this Orchestrator's business flow; the
+        RuntimeOrchestrator executes it through the PipelineExecutor.
+        """
+        registry = self.agents.registry
+
+        def _register(engine_id, factory):
+            if registry.has(engine_id):
+                return
+            registry.register(engine_id, factory)
+
+        _register("conversation", lambda r: ConversationEngine(self._process_turn))
+        _register("persistence", lambda r: PersistenceEngine())
+        _register("runtime_orchestrator", lambda r: RuntimeOrchestrator(registry=r))
+
     def process_message(self, user_message):
+        """Public entry point: execute the turn through the ConversationRuntime.
+
+        Returns the exact same turn dict the Orchestrator has always
+        returned — the runtime owns execution, this method owns nothing.
+        """
+        response = self.runtime.execute(ConversationRequest(
+            user_id=self.user_id,
+            session_id=self.user_id,
+            conversation_id=self.user_id,
+            message=user_message,
+        ))
+        return response.data
+
+    def _process_turn(self, user_message):
         turn_result = {
             "user_message": user_message,
             "risk_detected": False,
