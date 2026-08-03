@@ -12,6 +12,12 @@ from .policy import (_button_mode, _next_ladder_stage, _reset_ladder,
                        _QUICK_REPLY_ENTRY_PILLARS)
 from ..utils.storage import now_iso
 from .. import branch_policy
+from ..lifecycle_engine import (
+    LifecycleStage, BranchState,
+    evaluate_branch_lifecycle, get_next_stage,
+    is_forbidden_transition, is_valid_transition,
+    completion_score, is_complete,
+)
 
 
 class ConversationPlanner:
@@ -33,6 +39,7 @@ class ConversationPlanner:
         self._ladder_idx = 0
         self._ctx = None
         self._branch_state = None
+        self._lifecycle_state = None
 
     def reset(self):
         self.mode = None
@@ -49,6 +56,7 @@ class ConversationPlanner:
         self._ladder_idx = 0
         self._ctx = None
         self._branch_state = None
+        self._lifecycle_state = None
 
     def current_mode(self):
         return self.mode
@@ -71,6 +79,10 @@ class ConversationPlanner:
         primary_intent = (ig.get("primary_intent") or {}).get("intent", "")
         if emotion.get("risk_flag") or primary_intent == "crisis":
             return self._decide_escalation()
+
+        pillar = ctx.get("current_pillar")
+        if pillar:
+            self._lifecycle_state = evaluate_branch_lifecycle(pillar, ctx)
 
         if self.mode in _TEMPORARY_MODES and self.previous_mode is not None:
             decision = self._recover_from_interruption(message, ig, ctx.get("state"))
@@ -471,12 +483,16 @@ class ConversationPlanner:
         if self.mode not in (None, ConversationMode.DISCOVERY,
                              ConversationMode.INVESTIGATION):
             return None
+
         fills = branch_policy.detect_slot_fills(
             ctx.get("message") or "", pillar, ctx.get("intent_graph") or {})
         if not fills:
             return None
+
+        lifecycle = evaluate_branch_lifecycle(branch, ctx)
+
         if self._branch_state is None or self._branch_state.get("pillar") != pillar:
-            self._branch_state = {"pillar": pillar, "filled": set(),
+            self._branch_state = {"pillar": pillar, "filled": set(fills),
                                   "completed": False}
         self._branch_state["filled"].update(fills)
         state = self._branch_state
@@ -488,6 +504,7 @@ class ConversationPlanner:
         if len(filled_required) < definition["completion_threshold"]:
             return None
         state["completed"] = True
+
         self._enter_mode_for_state(ctx.get("state") or "")
         if self.mode != ConversationMode.COACHING:
             self._enter_mode(ConversationMode.COACHING, by="branch_completed",
@@ -505,6 +522,8 @@ class ConversationPlanner:
                 "filled": sorted(state["filled"]),
                 "missing": sorted(required - state["filled"]),
                 "next_actions": list(definition["next_actions"]),
+                "lifecycle_stage": lifecycle.current_stage.value,
+                "completion_score": lifecycle.completion_score,
             })
 
     def select_target_pillar(self, known_pillars=None, unknown_pillars=None,
