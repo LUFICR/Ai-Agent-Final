@@ -39,7 +39,9 @@ class ConversationStateMachine:
 
         if state == "greeting":
             words = user_message.strip().split()
-            if len(words) > 2 and self._has_topic_signal(user_message):
+            # A topic signal at greeting (even short — e.g. a clicked quick
+            # reply like "💼 Work") starts the topic immediately.
+            if self._has_topic_signal(user_message):
                 return "guided_discovery"
             if len(words) > 2:
                 return "free_conversation"

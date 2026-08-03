@@ -4,6 +4,7 @@ Spec: docs/specifications/QUESTION_SELECTION_POLICY.md
 
 Covered policies:
 1. Greeting Policy            — greetings never show category buttons
+                               (only conversation-entry quick replies)
 2. Rich Free Text Policy      — rich free text always beats buttons
 3. Button Policy              — buttons are a fallback, not the primary UI
 4. (no category questions when the problem is already described)
@@ -35,6 +36,7 @@ from wellness_agent.conversation_planner import (
     ConversationMode,
     ConversationPlanner,
     PlannerAction,
+    _QUICK_REPLY_ENTRY_BUTTONS,
 )
 
 FAILURES = []
@@ -85,8 +87,15 @@ def test_greetings_never_show_category_buttons():
     for msg in ("hi", "hello", "hey", "hey there", "good morning"):
         o = fresh_orch("gr")
         r = o.process_message(msg)
-        assert r.get("options") is None, \
-            "greeting %r must not offer buttons (got %r)" % (msg, r.get("options"))
+        pd = r.get("planner_decision") or {}
+        # Greeting shows the four conversation-ENTRY quick replies — these
+        # start a topic (Work/Relationships/Mental health/Physical health),
+        # they are NOT diagnostic category buttons.
+        assert r.get("options") == _QUICK_REPLY_ENTRY_BUTTONS, \
+            "greeting %r must offer conversation-entry quick replies (got %r)" % (
+                msg, r.get("options"))
+        assert pd.get("showQuickReplies") is True, pd
+        assert pd.get("quickReplyType") == "conversation_entry", pd
         assert action_of(r) == "ask_question", r.get("planner_decision")
         assert meta_of(r).get("greeting"), "greeting metadata missing"
         assert meta_of(r).get("button_mode") == "free", "greeting must be free text"

@@ -24,6 +24,7 @@ backward-compatible method (used by the legacy registry facade).
 import re
 from enum import Enum
 
+from . import branch_policy
 from .utils.storage import now_iso
 
 
@@ -90,7 +91,8 @@ _TEMPORARY_MODES = {ConversationMode.QUESTION_ANSWERING, ConversationMode.CASUAL
 class PlannerDecision:
     """The planner's output: exactly one action + the reasoning behind it."""
 
-    __slots__ = ("action", "reason", "confidence", "next_state", "metadata", "mode")
+    __slots__ = ("action", "reason", "confidence", "next_state", "metadata",
+                 "mode", "show_quick_replies", "quick_replies", "quick_reply_type")
 
     def __init__(self, action, reason, confidence=0.80, next_state=None,
                  metadata=None, mode=None):
@@ -100,6 +102,9 @@ class PlannerDecision:
         self.next_state = next_state
         self.metadata = metadata or {}
         self.mode = mode
+        self.show_quick_replies = False
+        self.quick_replies = []
+        self.quick_reply_type = ""
 
     def to_dict(self):
         return {
@@ -109,6 +114,9 @@ class PlannerDecision:
             "next_state": (self.next_state.value if isinstance(self.next_state, ConversationMode) else self.next_state),
             "metadata": dict(self.metadata or {}),
             "mode": (self.mode.value if isinstance(self.mode, ConversationMode) else self.mode),
+            "showQuickReplies": bool(self.show_quick_replies),
+            "quickReplies": list(self.quick_replies or []),
+            "quickReplyType": self.quick_reply_type or "",
         }
 
 
@@ -221,6 +229,43 @@ _TIME_RE = re.compile(
 _ASKING_ACTIONS = (PlannerAction.ASK_QUESTION, PlannerAction.EXPLORE_TOPIC,
                    PlannerAction.CLARIFY)
 
+# ─── QUICK REPLIES (dynamic conversation-entry buttons) ────────────────
+# Quick replies are conversation-ENTRY affordances — they start a topic,
+# they are NOT diagnostic categories. The planner attaches them only to
+# open prompts (greeting, soft exploration, no active topic) and never in
+# directive modes. They disappear once a topic is established and free
+# text always wins.
+
+_QUICK_REPLY_TYPE_CONVERSATION_ENTRY = "conversation_entry"
+
+_QUICK_REPLY_ENTRY_BUTTONS = [
+    "💼 Work",
+    "👨👩👧 Relationships",
+    "🧠 Mental health",
+    "🏃 Physical health",
+]
+
+# Button label -> pillar when the user clicks it (topic begins)
+_QUICK_REPLY_ENTRY_PILLARS = {
+    "mental health": "mood",
+    "physical health": "exercise",
+}
+
+_QUICK_REPLY_SUPPRESSED_MODES = {
+    ConversationMode.COMMITMENT,
+    ConversationMode.COACHING,
+    ConversationMode.REFLECTION,
+    ConversationMode.CASUAL_CHAT,
+    ConversationMode.SUMMARIZATION,
+    ConversationMode.CLOSURE,
+    ConversationMode.FOLLOW_UP,
+    ConversationMode.QUESTION_ANSWERING,
+    ConversationMode.ESCALATION,
+}
+
+_QUICK_REPLY_OPEN_STATES = {"greeting", "guided_discovery", "pillar_selection",
+                            "soft_exploration", "free_conversation"}
+
 # ─── QUESTION_SELECTION_POLICY.md (v1.0) — deterministic rules ─────────
 
 # Button Policy: buttons MAY appear only when the user cannot articulate
@@ -258,6 +303,8 @@ class ConversationPlanner:
         self._commit_stage = None
         self._asked = set()
         self._ladder_idx = 0
+        self._ctx = None
+        self._branch_state = None
 
     # ─── public API ─────────────────────────────────────────────────
 
@@ -275,6 +322,8 @@ class ConversationPlanner:
         self._commit_stage = None
         self._asked = set()
         self._ladder_idx = 0
+        self._ctx = None
+        self._branch_state = None
 
     def current_mode(self):
         return self.mode
@@ -302,6 +351,7 @@ class ConversationPlanner:
         message = (ctx.get("message") or "").strip()
         ig = ctx.get("intent_graph") or {}
         emotion = ctx.get("emotion") or {}
+        self._ctx = ctx
 
         # 1. ESCALATE — prevent harm, always first
         primary_intent = (ig.get("primary_intent") or {}).get("intent", "")
@@ -367,6 +417,14 @@ class ConversationPlanner:
                 ConversationMode.CLOSURE,
                 PlannerAction.CLOSE_CONVERSATION,
                 "summarization exits to closure", by="summarization_complete"))
+
+        # 8b. Branch Completion (evaluateBranchCompletion after every
+        # message): once the active branch's required-slot threshold is met,
+        # the planner NEVER asks another discovery question — it moves to the
+        # branch's terminal sequence (insight -> recommendation -> ...).
+        decision = self._branch_completion_gate(ctx)
+        if decision:
+            return self._record(decision)
 
         # 9. state-machine-driven flow (deterministic branch order)
         decision = self._state_flow(ctx)
@@ -530,12 +588,11 @@ class ConversationPlanner:
                 "repeated avoidance: offer to end the conversation",
                 metadata={"exit_offer": True})
 
-        if state == "rapport_building" and avoidance == 2 and not exit_consumed:
-            self._enter_mode_for_state(state)
-            return PlannerDecision(
-                PlannerAction.CASUAL_CHAT,
-                "avoidance at rapport: offer casual conversation",
-                metadata={"casual_offer": True})
+        # NOTE: the old generic fallback here ("avoidance at rapport ->
+        # CASUAL_CHAT with a 'want to just chat instead?' offer") is gone.
+        # Casual chat is entered ONLY on an explicit user request; the
+        # rapport_building branch below keeps the coaching conversation
+        # going with a low-pressure question instead.
 
         # Rich Free Text Policy: emotion/context/cause/timeline present ->
         # continue naturally; free text ALWAYS beats buttons. The planner
@@ -600,16 +657,43 @@ class ConversationPlanner:
             return PlannerDecision(PlannerAction.CHECK_PROGRESS,
                                    "follow-up: review progress on commitments")
 
+        # Slot Completion Policy: completing a required slot NEVER abandons
+        # the active topic. Evaluated in order:
+        #   1) more required slots missing   -> keep asking (same pillar)
+        #   2) confidence high enough        -> PROVIDE_INSIGHT (root-cause
+        #      route branch above wins when investigation confidence is met)
+        #   3) coaching should begin         -> mode stays INVESTIGATION
+        #   4) recommendation should be given -> routine_generator route
+        #      branch above wins when the arc is complete.
+        # This branch only fires when the state machine is in a transient
+        # state (e.g. free_conversation) after progress — it re-commits to
+        # the branch instead of falling back to CASUAL_CHAT.
+        ig = ctx.get("intent_graph") or {}
+        slot_progress = bool(ig.get("answered_current_question")) or \
+            bool(ig.get("new_slots_detected"))
+        if slot_progress and state not in ("greeting", "reflection", "follow_up"):
+            self._enter_mode_for_state(state)
+            return PlannerDecision(
+                PlannerAction.EXPLORE_TOPIC,
+                "slot completed: keep the active branch, never abandon the topic",
+                confidence=0.88,
+                metadata={"pillar": ctx.get("current_pillar"),
+                          "question_priority": self._next_ladder_stage(),
+                          "button_mode": "free", "slot_progress": True})
+
         if state == "free_conversation":
             self._enter_mode_for_state(state)
-            return PlannerDecision(PlannerAction.CASUAL_CHAT,
-                                   "free conversation continues naturally")
+            return PlannerDecision(
+                PlannerAction.ASK_QUESTION,
+                "open dialogue: keep coaching momentum, never auto-casual",
+                metadata={"open_dialogue": True, "button_mode": "free"})
 
         if state == "rapport_building":
             self._enter_mode_for_state(state)
-            return PlannerDecision(PlannerAction.CASUAL_CHAT,
-                                   "rapport building: easy, low-pressure exchange",
-                                   metadata={"rapport": True})
+            return PlannerDecision(
+                PlannerAction.ASK_QUESTION,
+                "rapport building: easy, low-pressure coaching question",
+                metadata={"rapport": True, "button_mode": "free"})
 
         if state == "avoidance_detection":
             self._enter_mode_for_state(state)
@@ -788,6 +872,63 @@ class ConversationPlanner:
     def _reset_ladder(self):
         self._ladder_idx = 0
 
+    # ─── branch completion (generic Branch Completion Engine) ─────────
+
+    def _branch_completion_gate(self, ctx):
+        """evaluateBranchCompletion(): threshold met -> terminal action.
+
+        Fires only on REAL slot evidence for the current pillar's branch
+        (never on an empty intent graph or off-topic messages). Once the
+        required-slot threshold is met the branch completes exactly once:
+        PROVIDE_INSIGHT, then the branch's next_actions sequence (driven by
+        the state machine: recommendation -> commitment -> summarize/close).
+        The active topic is kept until the user switches or ends it.
+        """
+        pillar = ctx.get("current_pillar")
+        if not pillar:
+            return None
+        branch = branch_policy.branch_for_pillar(pillar)
+        if branch is None:
+            return None
+        if self.mode not in (None, ConversationMode.DISCOVERY,
+                             ConversationMode.INVESTIGATION):
+            return None
+        fills = branch_policy.detect_slot_fills(
+            ctx.get("message") or "", pillar, ctx.get("intent_graph") or {})
+        if not fills:
+            return None
+        if self._branch_state is None or self._branch_state.get("pillar") != pillar:
+            self._branch_state = {"pillar": pillar, "filled": set(),
+                                  "completed": False}
+        self._branch_state["filled"].update(fills)
+        state = self._branch_state
+        if state["completed"]:
+            return None
+        definition = branch_policy.BRANCH_DEFINITIONS[branch]
+        required = set(definition["required_slots"])
+        filled_required = required & state["filled"]
+        if len(filled_required) < definition["completion_threshold"]:
+            return None
+        state["completed"] = True
+        self._enter_mode_for_state(ctx.get("state") or "")
+        if self.mode != ConversationMode.COACHING:
+            self._enter_mode(ConversationMode.COACHING, by="branch_completed",
+                             force=True)
+        return PlannerDecision(
+            PlannerAction.PROVIDE_INSIGHT,
+            "branch complete: %d/%d required slots filled" % (
+                len(filled_required), len(required)),
+            confidence=0.90,
+            metadata={
+                "branch_completion": True,
+                "branch": branch,
+                "pillar": pillar,
+                "insight": True,
+                "filled": sorted(state["filled"]),
+                "missing": sorted(required - state["filled"]),
+                "next_actions": list(definition["next_actions"]),
+            })
+
     # ─── mode persistence ──────────────────────────────────────────
 
     def _enter_mode(self, next_mode, by="", force=False):
@@ -826,7 +967,57 @@ class ConversationPlanner:
         self.last_decision = decision
         if decision.action not in _ASKING_ACTIONS:
             self._reset_ladder()
+        self._attach_quick_replies(decision)
         return decision
+
+    # ─── quick replies (dynamic conversation-entry buttons) ─────────
+
+    def _attach_quick_replies(self, decision):
+        """Quick Replies Policy (deterministic): attach the four
+        conversation-entry buttons ONLY to open prompts.
+
+        Suppressed when: a topic is established, the user typed free text
+        (free text always beats buttons), the message itself carries a topic
+        signal, the mode is directive (commitment/recommendation/reflection/
+        casual with a topic/summary/closure/follow-up/question-answering/
+        escalation), or the recovery tree/force-choice fallback is active.
+        Reappears only with no active topic + uncertainty or low confidence.
+        """
+        if decision is None or decision.action not in _ASKING_ACTIONS:
+            return
+        ctx = self._ctx or {}
+        if self.mode in _QUICK_REPLY_SUPPRESSED_MODES:
+            return
+        if self._pending_recommendation:
+            return
+        if ctx.get("current_pillar"):
+            return  # topic established -> buttons disappear
+        if ctx.get("has_topic_signal"):
+            return  # the message itself started a topic -> continue naturally
+        if self._is_rich_input(ctx):
+            return  # free text always beats buttons
+        meta = decision.metadata or {}
+        if meta.get("quick_tree") or meta.get("force_choice"):
+            return  # uncertainty recovery tree, not conversation entry
+
+        def _attach():
+            decision.show_quick_replies = True
+            decision.quick_replies = list(_QUICK_REPLY_ENTRY_BUTTONS)
+            decision.quick_reply_type = _QUICK_REPLY_TYPE_CONVERSATION_ENTRY
+
+        state = ctx.get("state") or ""
+        if state in _QUICK_REPLY_OPEN_STATES or meta.get("greeting"):
+            _attach()
+            return
+        # Reappear when unsure / planner confidence is low (no active topic)
+        message = (ctx.get("message") or "").strip()
+        ig = ctx.get("intent_graph") or {}
+        confidence = (ig.get("confidence_scores") or {}).get("overall_confidence")
+        if confidence is None:
+            confidence = ig.get("overall_confidence")
+        low_confidence = isinstance(confidence, (int, float)) and confidence < 0.60
+        if _UNCERTAINTY_RE.search(message) or low_confidence:
+            _attach()
 
     # ─── backward compatibility (legacy registry facade) ───────────
 
@@ -876,6 +1067,15 @@ class ConversationPlanner:
     def _detect_context_pillar(self, user_message, deprioritized):
         if not user_message:
             return None
+        # Quick Reply entry buttons: clicking one starts that pillar's topic
+        lower = user_message.lower()
+        for label, pillar in _QUICK_REPLY_ENTRY_PILLARS.items():
+            if pillar in deprioritized:
+                continue
+            if label in lower:
+                return {"target_pillar": pillar,
+                        "reason": "Quick reply entry: '%s'" % label,
+                        "urgency": "high"}
         pillar_map = {
             "sleep": [r"\bsleep\b", r"\binsomnia\b", r"\bbed\b", r"\btired\b", r"\brest\b", r"\bnightmare\b", r"\bcant sleep\b"],
             "stress": [r"\bstress\b", r"\bstressed\b", r"\boverwhelm\b", r"\bpressure\b", r"\bdrowning\b", r"\bdeadline\b"],

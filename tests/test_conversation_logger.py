@@ -30,6 +30,7 @@ from wellness_agent.conversation_logger import (  # noqa: E402
     get_conversation_logger,
     mask_secrets,
 )
+from wellness_agent.conversation_planner import _QUICK_REPLY_ENTRY_BUTTONS  # noqa: E402
 from wellness_agent.orchestrator import Orchestrator  # noqa: E402
 
 FAILURES = []
@@ -187,8 +188,8 @@ def test_buttons_and_clicked():
     orch = Orchestrator(user_id=UID, enable_learning=False,
                         enable_auto_judge=False)
     r1 = orch.process_message("hello")
-    assert r1.get("options") is None, \
-        "greeting policy: welcome must not offer category buttons"
+    assert r1.get("options") == _QUICK_REPLY_ENTRY_BUTTONS, \
+        "greeting must offer conversation-entry quick replies, not category buttons"
     r2 = orch.process_message("I'm really stressed about work deadlines")
     assert r2.get("options") is None, \
         "rich free text always beats buttons"

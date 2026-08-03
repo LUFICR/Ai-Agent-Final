@@ -420,6 +420,12 @@ class Orchestrator:
             self._planner_context(route, emotion, turn_result.get("intent_graph", {})))
         turn_result["planner_decision"] = decision.to_dict()
 
+        # Branch Completion: the active branch met its required-slot
+        # threshold — move the state machine to insight_generation so no
+        # further discovery questions are ever asked on this branch.
+        if (decision.metadata or {}).get("branch_completion"):
+            self.state_machine.set_state("insight_generation")
+
         # 8. LLM generates natural language only, given the context
         resp_data = self._generate_response(route, emotion, user_message, self.reasoning_ctx, decision)
 
@@ -440,6 +446,12 @@ class Orchestrator:
 
         turn_result["response"] = resp_data["text"]
         turn_result["options"] = resp_data["options"]
+        turn_result["show_quick_replies"] = bool(
+            getattr(decision, "show_quick_replies", False))
+        turn_result["quick_replies"] = list(
+            getattr(decision, "quick_replies", []) or [])
+        turn_result["quick_reply_type"] = getattr(
+            decision, "quick_reply_type", "") or ""
         turn_result["ranked_interventions"] = self._ranked_interventions[:5]
         turn_result["reasoning_context"] = self.reasoning_ctx
         # State may have changed inside response generation (category tree,
@@ -766,6 +778,13 @@ class Orchestrator:
             self._last_response_text = text
             self._last_response_state = state
 
+        # Quick Replies: conversation-entry buttons ride the options channel
+        # (the frontend renders data.options); they never override an
+        # executor's own options (recovery tree, force-choice, commitments).
+        if options is None and decision is not None \
+                and decision.show_quick_replies:
+            options = list(decision.quick_replies or [])
+
         resp["text"] = text
         resp["options"] = options
         return resp
@@ -806,11 +825,6 @@ class Orchestrator:
         text = "Totally okay — I'm here whenever you want to dig into something. Want me to just check in tomorrow instead?"
         options = ["Yes", "No"]
         self._exit_offered = True
-        return {"text": text, "options": options}
-
-    def _casual_offer_response(self):
-        text = "No pressure at all. Want to just chat about your day instead?"
-        options = ["Sure", "Not really", "Maybe later"]
         return {"text": text, "options": options}
 
     def _quick_tree_response(self, user_message):
@@ -948,8 +962,8 @@ class Orchestrator:
         return {"text": next(self._response_cyclers["default"]), "options": None}
 
     def _casual_chat_response(self, meta, state):
-        if meta.get("casual_offer"):
-            return self._casual_offer_response()
+        # Casual chat is only reached on an explicit user request — the
+        # planner never auto-offers it (no generic casual fallback).
         if meta.get("rapport"):
             return self._rapport_response()
         if state == "free_conversation":

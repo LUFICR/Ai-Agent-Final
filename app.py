@@ -47,6 +47,9 @@ async def chat(request: Request, message: str = Form(""), session_id: str = Form
     resp_data = {
         "response": result["response"],
         "options": result.get("options"),
+        "show_quick_replies": result.get("show_quick_replies", False),
+        "quick_replies": result.get("quick_replies", []),
+        "quick_reply_type": result.get("quick_reply_type", ""),
         "state": result["state"]["current_state"],
         "emotion": result["emotion"]["primary_emotion"],
         "risk": result["risk_detected"],
